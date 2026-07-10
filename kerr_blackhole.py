@@ -11,7 +11,7 @@ event horizon, or out to a checkerboard celestial sphere if it escapes.
 
 Controls (no on-screen UI):
     Left-drag     orbit camera (azimuth / inclination)
-    Scroll wheel  zoom (dolly camera distance)
+    Up / Down     zoom (dolly camera distance)
     A / D         decrease / increase black-hole spin a  (0 .. 0.998)
     W / S         decrease / increase disk color-temperature multiplier
     Esc           quit
@@ -366,9 +366,17 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
 
 # ----------------------------------------------------------------------
 # Interaction / main loop
+#
+# Uses the GGUI (ti.ui.Window) backend rather than the legacy ti.GUI: on
+# some Windows/GPU-driver combinations the legacy software-rendered GUI
+# window never actually appears on screen even though the simulation is
+# running (confirmed happening here), whereas GGUI reliably opens a real
+# window. The one tradeoff is that this Taichi build's GGUI has no scroll-
+# wheel event at all, so zoom is mapped to the Up/Down arrow keys instead.
 # ----------------------------------------------------------------------
 def main():
-    gui = ti.GUI("Kerr Black Hole", res=(WIDTH, HEIGHT), show_gui=False, fast_gui=True)
+    window = ti.ui.Window("Kerr Black Hole", (WIDTH, HEIGHT), vsync=True)
+    canvas = window.get_canvas()
 
     dragging = False
     last_pos = (0.0, 0.0)
@@ -376,42 +384,41 @@ def main():
     min_incl, max_incl = 0.08, math.pi - 0.08
     last_t = time.perf_counter()
 
-    while gui.running:
+    while window.running:
         now = time.perf_counter()
         dt = min(now - last_t, 0.1)
         last_t = now
 
-        for e in gui.get_events():
-            if e.key == ti.GUI.ESCAPE:
-                gui.running = False
-            elif e.key == ti.GUI.LMB and e.type == ti.GUI.PRESS:
-                dragging = True
-                last_pos = gui.get_cursor_pos()
-            elif e.key == ti.GUI.LMB and e.type == ti.GUI.RELEASE:
-                dragging = False
-            elif e.key == ti.GUI.WHEEL:
-                dy = e.delta[1]
-                cam_dist[None] = float(
-                    np.clip(cam_dist[None] - dy * 0.01 * cam_dist[None], 3.5, 90.0)
+        for e in window.get_events(ti.ui.PRESS):
+            if e.key == ti.ui.ESCAPE:
+                window.running = False
+
+        if window.is_pressed(ti.ui.LMB):
+            cur = window.get_cursor_pos()
+            if dragging:
+                dx = cur[0] - last_pos[0]
+                dy = cur[1] - last_pos[1]
+                cam_azimuth[None] = float(cam_azimuth[None] - dx * 3.5)
+                cam_incl[None] = float(
+                    np.clip(cam_incl[None] - dy * 3.0, min_incl, max_incl)
                 )
-
-        if dragging:
-            cur = gui.get_cursor_pos()
-            dx = cur[0] - last_pos[0]
-            dy = cur[1] - last_pos[1]
-            cam_azimuth[None] = float(cam_azimuth[None] - dx * 3.5)
-            cam_incl[None] = float(
-                np.clip(cam_incl[None] - dy * 3.0, min_incl, max_incl)
-            )
+            dragging = True
             last_pos = cur
+        else:
+            dragging = False
 
-        if gui.is_pressed('a'):
+        if window.is_pressed(ti.ui.UP):
+            cam_dist[None] = float(np.clip(cam_dist[None] * (1.0 - 1.2 * dt), 3.5, 90.0))
+        if window.is_pressed(ti.ui.DOWN):
+            cam_dist[None] = float(np.clip(cam_dist[None] * (1.0 + 1.2 * dt), 3.5, 90.0))
+
+        if window.is_pressed('a'):
             spin[None] = float(np.clip(spin[None] - 0.4 * dt, 0.0, 0.998))
-        if gui.is_pressed('d'):
+        if window.is_pressed('d'):
             spin[None] = float(np.clip(spin[None] + 0.4 * dt, 0.0, 0.998))
-        if gui.is_pressed('w'):
+        if window.is_pressed('w'):
             temp_mult[None] = float(np.clip(temp_mult[None] + 0.6 * dt, 0.2, 3.0))
-        if gui.is_pressed('s'):
+        if window.is_pressed('s'):
             temp_mult[None] = float(np.clip(temp_mult[None] - 0.6 * dt, 0.2, 3.0))
 
         sim_time[None] += dt
@@ -420,8 +427,8 @@ def main():
             spin[None], cam_dist[None], cam_incl[None], cam_azimuth[None],
             temp_mult[None], sim_time[None],
         )
-        gui.set_image(pixels)
-        gui.show()
+        canvas.set_image(pixels)
+        window.show()
 
 
 if __name__ == "__main__":
