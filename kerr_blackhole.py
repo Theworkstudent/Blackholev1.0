@@ -3,9 +3,11 @@ Real-time Kerr black hole ray-tracer (Taichi GPU backend).
 
 Fires one photon per pixel backward from an orbiting camera, integrates the
 full Kerr null-geodesic equations (Boyer-Lindquist coordinates, Carter's
-separated constants E=1, L, Q) with 4th-order Runge-Kutta, and shades the
-result against a thin Novikov-Thorne-like accretion disk or a checkerboard
-celestial sphere.
+separated constants E=1, L, Q) with 4th-order Runge-Kutta, and volumetrically
+marches each ray through a puffy, turbulent Novikov-Thorne-like accretion
+disk (real vertical thickness and semi-transparency, not a flat opaque
+plane) plus a faint "plunging matter" afterglow between the ISCO and the
+event horizon, or out to a checkerboard celestial sphere if it escapes.
 
 Controls (no on-screen UI):
     Left-drag     orbit camera (azimuth / inclination)
@@ -34,6 +36,20 @@ FOV = math.radians(50.0)
 TAN_HALF_FOV = math.tan(FOV / 2.0)
 T0 = 2.0e4          # disk temperature normalization (Kelvin)
 BRIGHT_SCALE = 650.0  # disk flux -> pre-tonemap brightness normalization
+
+# --- Disk volume (gives the disk real vertical thickness instead of being a
+# mathematically flat, zero-width plane) ---------------------------------
+DISK_H0 = 0.05          # scale height coefficient: local half-thickness ~= DISK_H0 * r
+DISK_OPACITY = 0.55      # optical depth per unit (density * path length); higher = more opaque
+TRANSMIT_CUTOFF = 0.03   # once this little light can still get through, treat the ray as blocked
+PUFF_AMP = 0.35          # how much the local scale height billows via turbulence (0..~1)
+
+# --- Plunging-matter afterglow: a faint, heavily redshifted glow from gas
+# that has passed the ISCO and is free-falling toward the horizon (real disks
+# don't cleanly cut off at the ISCO the way the idealized Novikov-Thorne flux
+# does; a little residual light continues, fading fast) --------------------
+PLUNGE_GLOW_SCALE = 55.0
+PLUNGE_TEMP = 9000.0     # reference color temperature of the plunging gas, before redshift
 
 # ----------------------------------------------------------------------
 # Persistent state
@@ -168,6 +184,19 @@ def blackbody_rgb(temp: ti.f32):
 
 
 # ----------------------------------------------------------------------
+# Turbulent scale-height modulation: makes the disk's vertical puffiness
+# billow and swirl with the gas's own local orbital rotation, instead of
+# being a rigid, perfectly smooth torus. Same rotating-phase trick used for
+# the brightness turbulence below, so the puffs visibly co-rotate with the
+# gas flow (inner puffs orbit faster than outer ones, just like the gas).
+# ----------------------------------------------------------------------
+@ti.func
+def puff_factor(r, phase):
+    n = ti.sin(phase * 5.0) * 0.5 + ti.sin(phase * 11.0 + r * 0.7) * 0.3 + ti.sin(phase * 23.0 - r) * 0.2
+    return ti.max(0.35, 1.0 + PUFF_AMP * n)
+
+
+# ----------------------------------------------------------------------
 # Celestial sphere: checkerboard by (theta, phi)
 # ----------------------------------------------------------------------
 @ti.func
@@ -237,13 +266,19 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
         pr = pr0
         pth = pth0
 
+        # Volumetric front-to-back accumulation: instead of stopping the ray
+        # the instant it crosses a mathematically flat disk plane, the disk
+        # is now a genuine 3D gas volume with a turbulent, billowing vertical
+        # density profile. Each step the ray spends inside that volume adds a
+        # little emitted light and eats a little transmittance, exactly like
+        # marching through fog -- so the disk reads as a puffy, glowing torus
+        # you can partly see through, not a razor-thin opaque sheet.
         color = ti.Vector([0.0, 0.0, 0.0])
-        hit = 0  # 0 = escaped/still traveling, 1 = horizon, 2 = disk
+        transmittance = 1.0
+        escaped_to_sky = 0
 
         for _s in range(MAX_STEPS):
             dl = BASE_DL * ti.min(ti.max(r * 0.15, 0.06), 15.0)
-            th_prev = th
-            r_prev = r
             nr, nth, nphi, npr, npth = rk4_step(r, th, phi, pr, pth, a, L, Q, dl)
 
             # polar reflection to keep theta in [0, pi]
@@ -256,32 +291,52 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
                 npth = -npth
                 nphi += math.pi
 
-            # equatorial-plane crossing test (disk)
-            eq_prev = th_prev - math.pi / 2.0
-            eq_curr = nth - math.pi / 2.0
-            if eq_prev * eq_curr < 0.0:
-                frac = eq_prev / (eq_prev - eq_curr)
-                r_cross = r_prev + frac * (nr - r_prev)
-                if r_cross >= r_isco and r_cross <= DISK_R_OUT:
-                    hit = 2
-                    omega_g = kerr_omega(r_cross, a)
-                    ut = kerr_ut(r_cross, a)
-                    g = 1.0 / (ut * (1.0 - L * omega_g))
-                    g = ti.max(g, 1e-3)
+            if nr >= r_h and nr <= DISK_R_OUT:
+                height = nr * ti.cos(nth)  # local height above the equatorial plane
+                density = 0.0
+                emission = ti.Vector([0.0, 0.0, 0.0])
 
-                    flux_shape = ti.max(1.0 - ti.sqrt(r_isco / r_cross), 1e-6)
-                    temp_prof = T0 * ti.pow(r_cross, -0.75) * ti.pow(flux_shape, 0.25)
-                    flux_prof = ti.pow(r_cross, -3.0) * flux_shape  # = (temp_prof/T0)^4
+                if nr >= r_isco:
+                    # --- main Novikov-Thorne-like emitting disk ---
+                    omega_g = kerr_omega(nr, a)
+                    ut = kerr_ut(nr, a)
+                    g = ti.max(1.0 / (ut * (1.0 - L * omega_g)), 1e-3)
 
-                    # animated turbulent texture: gas rotates at local Omega
+                    flux_shape = ti.max(1.0 - ti.sqrt(r_isco / nr), 1e-6)
+                    temp_prof = T0 * ti.pow(nr, -0.75) * ti.pow(flux_shape, 0.25)
+                    flux_prof = ti.pow(nr, -3.0) * flux_shape  # = (temp_prof/T0)^4
+
                     phase = nphi - omega_g * sim_t
-                    turb = 0.75 + 0.15 * ti.sin(phase * 6.0) + 0.10 * ti.sin(phase * 17.0 + r_cross)
+                    turb = 0.75 + 0.15 * ti.sin(phase * 6.0) + 0.10 * ti.sin(phase * 17.0 + nr)
                     turb = ti.max(turb, 0.15)
 
+                    scale_h = DISK_H0 * nr * puff_factor(nr, phase)
+                    density = ti.exp(-0.5 * (height / scale_h) ** 2)
+
                     t_obs = temp_prof * t_mult * g
-                    col = blackbody_rgb(t_obs)
-                    brightness = BRIGHT_SCALE * flux_prof * ti.pow(g, 4.0) * turb
-                    color = col * brightness
+                    emission = blackbody_rgb(t_obs) * (BRIGHT_SCALE * flux_prof * ti.pow(g, 4.0) * turb)
+                else:
+                    # --- plunging-matter afterglow between the ISCO and the
+                    # horizon: real infalling gas doesn't switch off the
+                    # instant it crosses the ISCO, it fades fast as it's
+                    # swallowed. Reuses the same circular-orbit redshift
+                    # formula (extended past its strict validity) purely as
+                    # a smooth, physically-flavored dimming/reddening curve.
+                    omega_g = kerr_omega(nr, a)
+                    ut = kerr_ut(nr, a)
+                    g = ti.max(1.0 / (ut * (1.0 - L * omega_g)), 1e-3)
+
+                    plunge_frac = ti.max((nr - r_h) / (r_isco - r_h), 0.0)
+                    scale_h = DISK_H0 * nr * 0.6
+                    density = ti.exp(-0.5 * (height / scale_h) ** 2)
+
+                    t_obs = PLUNGE_TEMP * t_mult * g
+                    emission = blackbody_rgb(t_obs) * (PLUNGE_GLOW_SCALE * plunge_frac * plunge_frac * ti.pow(g, 4.0))
+
+                if density > 1e-4:
+                    alpha = 1.0 - ti.exp(-DISK_OPACITY * density * dl)
+                    color += transmittance * alpha * emission
+                    transmittance *= (1.0 - alpha)
 
             r = nr
             th = nth
@@ -290,17 +345,16 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
             pth = npth
 
             if r <= r_h + 0.08:
-                hit = 1
-                color = ti.Vector([0.0, 0.0, 0.0])
+                transmittance = 0.0
+                break
             if r >= ESCAPE_R:
-                hit = 3
-                color = sky_color(th, phi % (2.0 * math.pi))
-
-            if hit != 0:
+                escaped_to_sky = 1
+                break
+            if transmittance < TRANSMIT_CUTOFF:
                 break
 
-        if hit == 0:
-            color = sky_color(th, phi % (2.0 * math.pi))
+        if escaped_to_sky or transmittance >= TRANSMIT_CUTOFF:
+            color += transmittance * sky_color(th, phi % (2.0 * math.pi))
 
         # luminance-based tonemap (preserves hue/saturation of bright pixels,
         # unlike a per-channel Reinhard curve which washes bright colors to white)
