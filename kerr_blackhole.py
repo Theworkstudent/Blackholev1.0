@@ -197,20 +197,68 @@ def puff_factor(r, phase):
 
 
 # ----------------------------------------------------------------------
-# Celestial sphere: checkerboard by (theta, phi)
+# Celestial sphere: a dense procedural starfield, evaluated as a pure
+# function of the ray's final (theta, phi) direction after it has been
+# bent by the full geodesic integration above. Because every star is just
+# a point sampled by whatever direction the bent ray happens to end up
+# pointing, gravitational lensing is fully "free": stars near the photon
+# ring get visibly smeared into arcs and duplicated (an Einstein-ring-like
+# effect), exactly the same way it would for real starlight.
 # ----------------------------------------------------------------------
+STAR_CELLS_U = 90.0   # star grid resolution in the phi direction
+STAR_CELLS_V = 45.0   # star grid resolution in the theta direction
+STAR_DENSITY = 0.32   # fraction of grid cells that contain a star
+
+
+@ti.func
+def hash21(p):
+    # classic cheap 2D->1D hash, returns a pseudo-random float in [0, 1)
+    h = ti.sin(p.dot(ti.Vector([127.1, 311.7]))) * 43758.5453
+    return h - ti.floor(h)
+
+
+@ti.func
+def star_palette(t):
+    # blend from warm white through pale blue to pale orange as t sweeps
+    # 0..1, giving the starfield a bit of real stellar-color variety
+    warm = ti.Vector([1.0, 0.85, 0.65])
+    white = ti.Vector([1.0, 1.0, 1.0])
+    blue = ti.Vector([0.75, 0.85, 1.0])
+    col = white
+    if t < 0.5:
+        col = warm + (white - warm) * (t / 0.5)
+    else:
+        col = white + (blue - white) * ((t - 0.5) / 0.5)
+    return col
+
+
 @ti.func
 def sky_color(th, phi):
-    u = phi / (2.0 * math.pi)
-    v = th / math.pi
-    cu = ti.floor(u * 24.0)
-    cv = ti.floor(v * 12.0)
-    checker = (cu + cv) % 2.0
-    base = 0.05 + 0.10 * checker
-    # subtle blue-white tint + a couple of bright "stars" bands for depth cues
-    col = ti.Vector([0.55, 0.62, 0.75]) * base
-    band = ti.exp(-ti.pow((v - 0.5) * 6.0, 2.0)) * 0.02
-    col += ti.Vector([1.0, 0.9, 0.8]) * band
+    u = phi / (2.0 * math.pi) * STAR_CELLS_U
+    v = th / math.pi * STAR_CELLS_V
+
+    # faint nebular gradient so the background isn't pure flat black
+    vv = th / math.pi
+    base = ti.Vector([0.015, 0.018, 0.03])
+    band = ti.exp(-ti.pow((vv - 0.5) * 6.0, 2.0)) * 0.03
+    col = base + ti.Vector([0.35, 0.32, 0.30]) * band
+
+    cell = ti.Vector([ti.floor(u), ti.floor(v)])
+    for dx, dy in ti.ndrange((-1, 2), (-1, 2)):
+        c = cell + ti.Vector([float(dx), float(dy)])
+        present = hash21(c)
+        if present < STAR_DENSITY:
+            frac = ti.Vector([hash21(c + ti.Vector([3.1, 7.7])), hash21(c + ti.Vector([9.3, 2.2]))])
+            star_pos = c + frac
+            d = ti.Vector([u, v]) - star_pos
+            dist2 = d.dot(d)
+
+            brightness_seed = hash21(c + ti.Vector([5.5, 1.3]))
+            brightness = ti.pow(brightness_seed, 9.0) * 26.0  # mostly dim, a few standouts
+            size = 0.10 + 0.10 * hash21(c + ti.Vector([2.2, 8.8]))
+            color_seed = hash21(c + ti.Vector([4.4, 6.6]))
+
+            col += star_palette(color_seed) * brightness * ti.exp(-dist2 / (size * size))
     return col
 
 
@@ -306,14 +354,27 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
                     temp_prof = T0 * ti.pow(nr, -0.75) * ti.pow(flux_shape, 0.25)
                     flux_prof = ti.pow(nr, -3.0) * flux_shape  # = (temp_prof/T0)^4
 
+                    # Multi-octave turbulence, phase-locked to the LOCAL Kerr
+                    # Keplerian angular velocity, so clumps visibly co-rotate
+                    # at the correct differential rate (inner clumps lap
+                    # outer ones) as sim_t advances. Modulates both
+                    # brightness AND color temperature together (hot clumps
+                    # glow bluer-white, cool gaps sink toward orange-red),
+                    # which reads as real swirling turbulent gas rather than
+                    # a flat, uniformly-colored ring.
                     phase = nphi - omega_g * sim_t
-                    turb = 0.75 + 0.15 * ti.sin(phase * 6.0) + 0.10 * ti.sin(phase * 17.0 + nr)
-                    turb = ti.max(turb, 0.15)
+                    turb = (
+                        0.65
+                        + 0.20 * ti.sin(phase * 6.0)
+                        + 0.13 * ti.sin(phase * 17.0 + nr)
+                        + 0.09 * ti.sin(phase * 29.0 - nr * 1.3)
+                    )
+                    turb = ti.max(turb, 0.12)
 
                     scale_h = DISK_H0 * nr * puff_factor(nr, phase)
                     density = ti.exp(-0.5 * (height / scale_h) ** 2)
 
-                    t_obs = temp_prof * t_mult * g
+                    t_obs = temp_prof * t_mult * g * (0.7 + 0.5 * turb)
                     emission = blackbody_rgb(t_obs) * (BRIGHT_SCALE * flux_prof * ti.pow(g, 4.0) * turb)
                 else:
                     # --- plunging-matter afterglow between the ISCO and the
