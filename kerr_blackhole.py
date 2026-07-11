@@ -1,22 +1,3 @@
-"""
-Real-time Kerr black hole ray-tracer (Taichi GPU backend).
-
-Fires one photon per pixel backward from an orbiting camera, integrates the
-full Kerr null-geodesic equations (Boyer-Lindquist coordinates, Carter's
-separated constants E=1, L, Q) with 4th-order Runge-Kutta, and volumetrically
-marches each ray through a puffy, turbulent Novikov-Thorne-like accretion
-disk (real vertical thickness and semi-transparency, not a flat opaque
-plane) plus a faint "plunging matter" afterglow between the ISCO and the
-event horizon, or out to a checkerboard celestial sphere if it escapes.
-
-Controls (no on-screen UI):
-    Left-drag     orbit camera (azimuth / inclination)
-    Up / Down     zoom (dolly camera distance)
-    A / D         decrease / increase black-hole spin a  (0 .. 0.998)
-    W / S         decrease / increase disk color-temperature multiplier
-    Esc           quit
-"""
-
 import math
 import time
 import numpy as np
@@ -24,9 +5,6 @@ import taichi as ti
 
 ti.init(arch=ti.gpu, default_fp=ti.f32)
 
-# ----------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------
 WIDTH, HEIGHT = 512, 512
 MAX_STEPS = 400
 BASE_DL = 0.09
@@ -34,26 +12,17 @@ ESCAPE_R = 45.0
 DISK_R_OUT = 16.0
 FOV = math.radians(50.0)
 TAN_HALF_FOV = math.tan(FOV / 2.0)
-T0 = 2.0e4          # disk temperature normalization (Kelvin)
-BRIGHT_SCALE = 650.0  # disk flux -> pre-tonemap brightness normalization
+T0 = 2.0e4
+BRIGHT_SCALE = 650.0
 
-# --- Disk volume (gives the disk real vertical thickness instead of being a
-# mathematically flat, zero-width plane) ---------------------------------
-DISK_H0 = 0.05          # scale height coefficient: local half-thickness ~= DISK_H0 * r
-DISK_OPACITY = 0.55      # optical depth per unit (density * path length); higher = more opaque
-TRANSMIT_CUTOFF = 0.03   # once this little light can still get through, treat the ray as blocked
-PUFF_AMP = 0.35          # how much the local scale height billows via turbulence (0..~1)
+DISK_H0 = 0.05
+DISK_OPACITY = 0.55
+TRANSMIT_CUTOFF = 0.03
+PUFF_AMP = 0.35
 
-# --- Plunging-matter afterglow: a faint, heavily redshifted glow from gas
-# that has passed the ISCO and is free-falling toward the horizon (real disks
-# don't cleanly cut off at the ISCO the way the idealized Novikov-Thorne flux
-# does; a little residual light continues, fading fast) --------------------
 PLUNGE_GLOW_SCALE = 55.0
-PLUNGE_TEMP = 9000.0     # reference color temperature of the plunging gas, before redshift
+PLUNGE_TEMP = 9000.0
 
-# ----------------------------------------------------------------------
-# Persistent state
-# ----------------------------------------------------------------------
 pixels = ti.Vector.field(3, dtype=ti.f32, shape=(WIDTH, HEIGHT))
 
 spin = ti.field(dtype=ti.f32, shape=())
@@ -72,9 +41,6 @@ cam_incl[None] = 1.0
 cam_dist[None] = 42.0
 
 
-# ----------------------------------------------------------------------
-# Kerr metric building blocks (G = c = M = 1)
-# ----------------------------------------------------------------------
 @ti.func
 def horizon_radius(a: ti.f32) -> ti.f32:
     return 1.0 + ti.sqrt(ti.max(1.0 - a * a, 0.0))
@@ -92,22 +58,15 @@ def isco_radius(a: ti.f32) -> ti.f32:
 
 @ti.func
 def kerr_omega(r: ti.f32, a: ti.f32) -> ti.f32:
-    # Keplerian angular velocity of prograde circular equatorial orbit
     return 1.0 / (ti.pow(r, 1.5) + a)
 
 
 @ti.func
 def kerr_ut(r: ti.f32, a: ti.f32) -> ti.f32:
-    # u^t for a circular equatorial geodesic (Bardeen-Press-Teukolsky 1972)
     disc = ti.max(ti.pow(r, 1.5) - 3.0 * ti.sqrt(r) + 2.0 * a, 1e-6)
     return (ti.pow(r, 1.5) + a) / (ti.pow(r, 0.75) * ti.sqrt(disc))
 
 
-# ----------------------------------------------------------------------
-# Geodesic right-hand side. State = (r, theta, phi, p_r, p_theta)
-# Conserved per-ray parameters: a (spin), L (ang. momentum), Q (Carter const)
-# Energy at infinity fixed to E = 1.
-# ----------------------------------------------------------------------
 @ti.func
 def geodesic_rhs(r, th, pr, pth, a, L, Q):
     sth = ti.sin(th)
@@ -155,9 +114,6 @@ def rk4_step(r, th, phi, pr, pth, a, L, Q, dl):
     return nr, nth, nphi, npr, npth
 
 
-# ----------------------------------------------------------------------
-# Blackbody temperature (Kelvin) -> linear sRGB, Tanner Helland approximation
-# ----------------------------------------------------------------------
 @ti.func
 def blackbody_rgb(temp: ti.f32):
     t = ti.min(ti.max(temp, 1000.0), 40000.0) / 100.0
@@ -177,50 +133,30 @@ def blackbody_rgb(temp: ti.f32):
     else:
         b = 138.5177312231 * ti.log(t - 10.0) - 305.0447927307
     rgb = ti.max(ti.Vector([r, g, b]) / 255.0, 0.0)
-    # punch up saturation a bit for a more dramatic cinematic palette
     lum = rgb.dot(ti.Vector([0.299, 0.587, 0.114]))
     rgb = ti.max(lum + (rgb - lum) * 1.6, 0.0)
     return rgb
 
 
-# ----------------------------------------------------------------------
-# Turbulent scale-height modulation: makes the disk's vertical puffiness
-# billow and swirl with the gas's own local orbital rotation, instead of
-# being a rigid, perfectly smooth torus. Same rotating-phase trick used for
-# the brightness turbulence below, so the puffs visibly co-rotate with the
-# gas flow (inner puffs orbit faster than outer ones, just like the gas).
-# ----------------------------------------------------------------------
 @ti.func
 def puff_factor(r, phase):
     n = ti.sin(phase * 5.0) * 0.5 + ti.sin(phase * 11.0 + r * 0.7) * 0.3 + ti.sin(phase * 23.0 - r) * 0.2
     return ti.max(0.35, 1.0 + PUFF_AMP * n)
 
 
-# ----------------------------------------------------------------------
-# Celestial sphere: a dense procedural starfield, evaluated as a pure
-# function of the ray's final (theta, phi) direction after it has been
-# bent by the full geodesic integration above. Because every star is just
-# a point sampled by whatever direction the bent ray happens to end up
-# pointing, gravitational lensing is fully "free": stars near the photon
-# ring get visibly smeared into arcs and duplicated (an Einstein-ring-like
-# effect), exactly the same way it would for real starlight.
-# ----------------------------------------------------------------------
-STAR_CELLS_U = 90.0   # star grid resolution in the phi direction
-STAR_CELLS_V = 45.0   # star grid resolution in the theta direction
-STAR_DENSITY = 0.32   # fraction of grid cells that contain a star
+STAR_CELLS_U = 90.0
+STAR_CELLS_V = 45.0
+STAR_DENSITY = 0.32
 
 
 @ti.func
 def hash21(p):
-    # classic cheap 2D->1D hash, returns a pseudo-random float in [0, 1)
     h = ti.sin(p.dot(ti.Vector([127.1, 311.7]))) * 43758.5453
     return h - ti.floor(h)
 
 
 @ti.func
 def star_palette(t):
-    # blend from warm white through pale blue to pale orange as t sweeps
-    # 0..1, giving the starfield a bit of real stellar-color variety
     warm = ti.Vector([1.0, 0.85, 0.65])
     white = ti.Vector([1.0, 1.0, 1.0])
     blue = ti.Vector([0.75, 0.85, 1.0])
@@ -237,7 +173,6 @@ def sky_color(th, phi):
     u = phi / (2.0 * math.pi) * STAR_CELLS_U
     v = th / math.pi * STAR_CELLS_V
 
-    # faint nebular gradient so the background isn't pure flat black
     vv = th / math.pi
     base = ti.Vector([0.015, 0.018, 0.03])
     band = ti.exp(-ti.pow((vv - 0.5) * 6.0, 2.0)) * 0.03
@@ -254,7 +189,7 @@ def sky_color(th, phi):
             dist2 = d.dot(d)
 
             brightness_seed = hash21(c + ti.Vector([5.5, 1.3]))
-            brightness = ti.pow(brightness_seed, 9.0) * 26.0  # mostly dim, a few standouts
+            brightness = ti.pow(brightness_seed, 9.0) * 26.0
             size = 0.10 + 0.10 * hash21(c + ti.Vector([2.2, 8.8]))
             color_seed = hash21(c + ti.Vector([4.4, 6.6]))
 
@@ -262,9 +197,6 @@ def sky_color(th, phi):
     return col
 
 
-# ----------------------------------------------------------------------
-# Main render kernel: one photon per pixel
-# ----------------------------------------------------------------------
 @ti.kernel
 def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
            t_mult: ti.f32, sim_t: ti.f32):
@@ -275,7 +207,6 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
         sx = (2.0 * (i + 0.5) / WIDTH - 1.0) * TAN_HALF_FOV
         sy = (2.0 * (j + 0.5) / HEIGHT - 1.0) * TAN_HALF_FOV
 
-        # local ray direction in (r_hat, theta_hat, phi_hat) ZAMO axes
         dvec = ti.Vector([-1.0, sy, sx])
         dvec = dvec / dvec.norm()
         n_r, n_th, n_ph = dvec[0], dvec[1], dvec[2]
@@ -314,13 +245,6 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
         pr = pr0
         pth = pth0
 
-        # Volumetric front-to-back accumulation: instead of stopping the ray
-        # the instant it crosses a mathematically flat disk plane, the disk
-        # is now a genuine 3D gas volume with a turbulent, billowing vertical
-        # density profile. Each step the ray spends inside that volume adds a
-        # little emitted light and eats a little transmittance, exactly like
-        # marching through fog -- so the disk reads as a puffy, glowing torus
-        # you can partly see through, not a razor-thin opaque sheet.
         color = ti.Vector([0.0, 0.0, 0.0])
         transmittance = 1.0
         escaped_to_sky = 0
@@ -329,7 +253,6 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
             dl = BASE_DL * ti.min(ti.max(r * 0.15, 0.06), 15.0)
             nr, nth, nphi, npr, npth = rk4_step(r, th, phi, pr, pth, a, L, Q, dl)
 
-            # polar reflection to keep theta in [0, pi]
             if nth < 0.0:
                 nth = -nth
                 npth = -npth
@@ -340,28 +263,19 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
                 nphi += math.pi
 
             if nr >= r_h and nr <= DISK_R_OUT:
-                height = nr * ti.cos(nth)  # local height above the equatorial plane
+                height = nr * ti.cos(nth)
                 density = 0.0
                 emission = ti.Vector([0.0, 0.0, 0.0])
 
                 if nr >= r_isco:
-                    # --- main Novikov-Thorne-like emitting disk ---
                     omega_g = kerr_omega(nr, a)
                     ut = kerr_ut(nr, a)
                     g = ti.max(1.0 / (ut * (1.0 - L * omega_g)), 1e-3)
 
                     flux_shape = ti.max(1.0 - ti.sqrt(r_isco / nr), 1e-6)
                     temp_prof = T0 * ti.pow(nr, -0.75) * ti.pow(flux_shape, 0.25)
-                    flux_prof = ti.pow(nr, -3.0) * flux_shape  # = (temp_prof/T0)^4
+                    flux_prof = ti.pow(nr, -3.0) * flux_shape
 
-                    # Multi-octave turbulence, phase-locked to the LOCAL Kerr
-                    # Keplerian angular velocity, so clumps visibly co-rotate
-                    # at the correct differential rate (inner clumps lap
-                    # outer ones) as sim_t advances. Modulates both
-                    # brightness AND color temperature together (hot clumps
-                    # glow bluer-white, cool gaps sink toward orange-red),
-                    # which reads as real swirling turbulent gas rather than
-                    # a flat, uniformly-colored ring.
                     phase = nphi - omega_g * sim_t
                     turb = (
                         0.65
@@ -377,12 +291,6 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
                     t_obs = temp_prof * t_mult * g * (0.7 + 0.5 * turb)
                     emission = blackbody_rgb(t_obs) * (BRIGHT_SCALE * flux_prof * ti.pow(g, 4.0) * turb)
                 else:
-                    # --- plunging-matter afterglow between the ISCO and the
-                    # horizon: real infalling gas doesn't switch off the
-                    # instant it crosses the ISCO, it fades fast as it's
-                    # swallowed. Reuses the same circular-orbit redshift
-                    # formula (extended past its strict validity) purely as
-                    # a smooth, physically-flavored dimming/reddening curve.
                     omega_g = kerr_omega(nr, a)
                     ut = kerr_ut(nr, a)
                     g = ti.max(1.0 / (ut * (1.0 - L * omega_g)), 1e-3)
@@ -417,24 +325,12 @@ def render(a: ti.f32, r_cam: ti.f32, th_cam: ti.f32, phi_cam: ti.f32,
         if escaped_to_sky or transmittance >= TRANSMIT_CUTOFF:
             color += transmittance * sky_color(th, phi % (2.0 * math.pi))
 
-        # luminance-based tonemap (preserves hue/saturation of bright pixels,
-        # unlike a per-channel Reinhard curve which washes bright colors to white)
         lum = ti.max(color[0], ti.max(color[1], color[2]))
         color = color / (1.0 + lum)
         color = ti.pow(ti.max(color, 0.0), 1.0 / 2.2)
         pixels[i, j] = color
 
 
-# ----------------------------------------------------------------------
-# Interaction / main loop
-#
-# Uses the GGUI (ti.ui.Window) backend rather than the legacy ti.GUI: on
-# some Windows/GPU-driver combinations the legacy software-rendered GUI
-# window never actually appears on screen even though the simulation is
-# running (confirmed happening here), whereas GGUI reliably opens a real
-# window. The one tradeoff is that this Taichi build's GGUI has no scroll-
-# wheel event at all, so zoom is mapped to the Up/Down arrow keys instead.
-# ----------------------------------------------------------------------
 def main():
     window = ti.ui.Window("Kerr Black Hole", (WIDTH, HEIGHT), vsync=True)
     canvas = window.get_canvas()
